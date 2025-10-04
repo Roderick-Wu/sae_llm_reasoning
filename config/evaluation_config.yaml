@@ -1,0 +1,21 @@
+# Evaluation Configuration File
+# Configuration for comparing SAE vs steering methods
+
+# Model and paths
+model_name: "Llama-3.1-8B"
+model_dir: "/home/wuroderi/projects/def-zhijing/wuroderi/models"
+sae_models_path: "/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/outputs/final_results/models"
+hs_cache_path: "/home/wuroderi/projects/def-zhijing/wuroderi/Linear_Reasoning_Features/outputs"
+dataset_dir: "/home/wuroderi/projects/def-zhijing/wuroderi/Linear_Reasoning_Features/dataset"
+output_dir: "/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/evaluation_results"
+
+# Evaluation parameters
+test_datasets: ["mgsm", "gsm8k"]  # Start with these datasets
+reasoning_threshold: 0.5
+intervention_scales: [0.1, 0.3, 0.5, 0.8, 1.0]  # Range of intervention strengths to test
+layers_to_evaluate: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]  # Focus on later layers for reasoning
+
+# Generation parameters
+max_new_tokens: 100
+batch_size: 4  # Smaller batch size for generation
+device: "cuda"
