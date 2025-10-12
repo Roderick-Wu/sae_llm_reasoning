@@ -183,7 +183,7 @@ class SAETrainer:
         if not os.path.exists(hs_cache_path):
             raise FileNotFoundError(f"Hidden states cache not found: {hs_cache_path}")
         
-        hs_cache = torch.load(hs_cache_path, map_location='cpu')
+        hs_cache = torch.load(hs_cache_path, map_location='cpu', weights_only=False)
         
         # Load reasoning scores
         with open(os.path.join(self.config.dataset_dir, 'mmlu-pro-3000samples.json'), 'r') as f:
@@ -339,16 +339,16 @@ class SAETrainer:
         
         sae = self.saes[layer]
         dataset = self.datasets[layer]
-        
+
+        all_sparse_acts = []
+        all_labels = []
+        all_hidden_states = []
+
         sae.eval()
         with torch.no_grad():
             # Get all activations
             dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=False)
-            
-            all_sparse_acts = []
-            all_labels = []
-            all_hidden_states = []
-            
+             
             for batch in tqdm(dataloader, desc="Extracting features"):
                 hidden_states = batch['hidden_states'].to(self.device)
                 labels = batch['labels']
