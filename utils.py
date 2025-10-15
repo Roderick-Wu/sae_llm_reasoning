@@ -491,6 +491,11 @@ def compute_performance_on_reason_memory_subset(val_sampled_data=None, memory_in
         print(f"***Original performance of Memory Subset Accuracy: {memory_accuracy:.4f}")
         print(f"***Original performance of Reason Subset Accuracy: {reason_accuracy:.4f}")
 
+    return {
+        'memory_accuracy': memory_accuracy,
+        'reason_accuracy': reason_accuracy
+    }
+
 def compute_performance_on_reason_subset(val_sampled_data=None, intervention=False, ds_name=None, intervention_layer=None):
 
     
@@ -509,7 +514,10 @@ def compute_performance_on_reason_subset(val_sampled_data=None, intervention=Fal
     else:
         print(f"***Original performance of Reason Subset {ds_name} Accuracy: {reason_accuracy:.4f}")
 
-        
+    return {
+        'reason_accuracy': reason_accuracy
+    }
+
 def get_prediction(output=None, ds_name='MMLU-Pro'):
     
     if ds_name == 'MMLU-Pro':

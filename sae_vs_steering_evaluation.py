@@ -23,8 +23,6 @@ from utils import (
     load_dataset, 
     load_prompt_template, 
     get_prediction, 
-    compute_performance_on_reason_memory_subset,
-    compute_performance_on_reason_subset,
     generate_questions,
     form_options,
     form_options_ceval
@@ -45,8 +43,12 @@ class EvaluationConfig:
     output_dir: str = "/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/evaluation_results"
     
     # Evaluation parameters
+    # Dataset types:
+    # - Reasoning: gsm8k, gsm-symbolic, mgsm  
+    # - Memory: popqa, c-eval-h
+    # - Mixed (needs reasoning_threshold): mmlu-pro
     test_datasets: List[str] = field(default_factory=lambda: ['gsm8k', 'popqa', 'mmlu-pro'])
-    reasoning_threshold: float = 0.5
+    reasoning_threshold: float = 0.5  # Only used for mmlu-pro to split reasoning vs memory
     intervention_scales: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.8, 1.0])
     layers_to_evaluate: List[int] = field(default_factory=lambda: [10, 15, 20, 25])
     
@@ -178,6 +180,8 @@ class InterventionEvaluator:
         
         # Results storage
         self.results = {}
+
+        self.generate_token_count = 200
     
     def load_model(self):
         """Load the language model for evaluation"""
@@ -297,7 +301,7 @@ class InterventionEvaluator:
                     # Baseline generation without intervention
                     responses = generate_questions(
                         model=self.model, tokenizer=self.tokenizer, 
-                        questions=queries_batch, n_new_tokens=200
+                        questions=queries_batch, n_new_tokens=self.generate_token_count
                     )
                     
                 # Process responses and compute correctness (same as utils version)
@@ -351,6 +355,33 @@ class InterventionEvaluator:
                         
                 queries_batch = []
                 entry_batch = []
+        
+        # Compute performance metrics after processing all data
+        if ds_name == 'MMLU-Pro':
+            # Split MMLU-Pro into reasoning vs memory based on scores
+            reason_data = [entry for entry in val_sampled_data if entry.get('memory_reason_score', 0) > 0.5]
+            memory_data = [entry for entry in val_sampled_data if entry.get('memory_reason_score', 0) <= 0.5]
+            
+            # Compute accuracies
+            memory_correct = sum(1 for entry in memory_data if entry.get('model_predict_correctness', False))
+            reason_correct = sum(1 for entry in reason_data if entry.get('model_predict_correctness', False))
+            
+            memory_accuracy = memory_correct / len(memory_data) if len(memory_data) > 0 else 0.0
+            reason_accuracy = reason_correct / len(reason_data) if len(reason_data) > 0 else 0.0
+            
+            return {
+                'memory_accuracy': memory_accuracy,
+                'reason_accuracy': reason_accuracy
+            }
+        else:
+            # For other datasets, compute overall reasoning accuracy
+            correct_predictions = sum(1 for entry in val_sampled_data if entry.get('model_predict_correctness', False))
+            total_predictions = len(val_sampled_data)
+            reason_accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+            
+            return {
+                'reason_accuracy': reason_accuracy
+            }
     
     def generate_with_sae_intervention(self, questions, intervention_layer, intervention_directions, 
                                      intervention_type, scale):
@@ -360,28 +391,31 @@ class InterventionEvaluator:
                                return_token_type_ids=False).to(self.device)
         input_length = inputs.input_ids.size(1)
 
+        # Get SAE model for activation patching (if needed)
+        sae_model = None
+        if intervention_type == 'activation_patching' and intervention_layer in self.feature_extractor.sae_models:
+            sae_model = self.feature_extractor.sae_models[intervention_layer]
+        
         # Create SAE intervention hooks
         hooks = self.set_sae_intervention_hooks(
-            intervention_layer, intervention_directions, intervention_type, scale
+            intervention_layer, intervention_directions, intervention_type, scale, sae_model
         )
         
         # Generate with hooks
-        gen_tokens = self.model.generate(**inputs, max_new_tokens=200, do_sample=False)
+        gen_tokens = self.model.generate(**inputs, max_new_tokens=self.generate_token_count, do_sample=False)
         
-        # Remove hooks
         self.remove_hooks(hooks)
 
-        # Decode generated text
         gen_text = self.tokenizer.batch_decode(gen_tokens[:, input_length:], skip_special_tokens=True)
         
         return gen_text
     
-    def set_sae_intervention_hooks(self, layer, directions, intervention_type, scale):
+    def set_sae_intervention_hooks(self, layer, directions, intervention_type, scale, sae_model=None):
         """Set up hooks for SAE intervention at a specific layer"""
         
         hooks = []
         
-        def create_sae_intervention_hook(directions, intervention_type, scale):
+        def create_sae_intervention_hook(directions, intervention_type, scale, sae_model=None):
             def hook_fn(module, input, output):
                 # Handle tuple output (common in transformers)
                 if isinstance(output, tuple):
@@ -392,7 +426,7 @@ class InterventionEvaluator:
                 # Apply intervention to all positions (not just last token like steering)
                 if intervention_type == 'projected':
                     # Use decoder weights as directions (existing approach)
-                    directions_tensor = directions.to(hidden_states.device).to(hidden_states.dtype)
+                    directions_tensor = directions['feature_directions'].to(hidden_states.device).to(hidden_states.dtype)
                     
                     # Apply each feature direction
                     for direction in directions_tensor:
@@ -401,35 +435,55 @@ class InterventionEvaluator:
                         hidden_states = hidden_states + scale * projection
                         
                 elif intervention_type == 'raw':
-                    # Add raw sparse feature activations directly
-                    # These are scalar activations, so we need to broadcast them to the hidden dimension
-                    activations = directions.to(hidden_states.device).to(hidden_states.dtype)
+                    # Use feature directions directly without projection (more forceful than projected)
+                    # Scale each feature direction by its corresponding reasoning activation value
+                    feature_directions = directions['feature_directions'].to(hidden_states.device).to(hidden_states.dtype)
+                    reasoning_activations = directions['reasoning_activations'].to(hidden_states.device).to(hidden_states.dtype)
                     
-                    # Raw activations are 1D (top_k features), expand to match hidden_states
-                    # For simplicity, we'll create a simple broadcasting pattern
-                    batch_size, seq_len, hidden_dim = hidden_states.shape
+                    # Add each feature direction scaled by its activation directly
+                    for i, (direction, activation) in enumerate(zip(feature_directions, reasoning_activations)):
+                        # Scale the feature direction by the activation strength and intervention scale
+                        scaled_direction = direction * activation * scale
+                        hidden_states = hidden_states + scaled_direction
+                        
+                elif intervention_type == 'activation_patching':
+                    # Activation patching: encode to sparse, modify top-k features, decode back
+                    if sae_model is None:
+                        raise ValueError("SAE model required for activation patching intervention")
                     
-                    # Create a simple activation pattern: repeat activation values across hidden dimensions
-                    if len(activations.shape) == 1:  # [top_k]
-                        # Repeat each activation across (hidden_dim // top_k) dimensions
-                        top_k = activations.shape[0]
-                        if hidden_dim % top_k == 0:
-                            repeat_factor = hidden_dim // top_k
-                            activation_pattern = activations.repeat_interleave(repeat_factor)
-                        else:
-                            # Handle case where hidden_dim doesn't divide evenly
-                            activation_pattern = torch.zeros(hidden_dim, device=activations.device, dtype=activations.dtype)
-                            step = hidden_dim // top_k
-                            for i, act in enumerate(activations):
-                                start_idx = i * step
-                                end_idx = min(start_idx + step, hidden_dim)
-                                activation_pattern[start_idx:end_idx] = act
+                    # Get original shape
+                    original_shape = hidden_states.shape  # [batch, seq, hidden]
+                    
+                    # Flatten to [batch*seq, hidden] for SAE processing
+                    flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
+                    
+                    # Encode to sparse representation
+                    sparse_acts = sae_model.encode(flat_hidden)  # [batch*seq, dict_size]
+                    
+                    # Get top-k feature indices and values for modification
+                    top_indices = directions.get('feature_indices', None)
+                    reasoning_activations = directions['reasoning_activations'].to(hidden_states.device).to(hidden_states.dtype)
+                    
+                    if top_indices is not None:
+                        # Convert to tensor if needed
+                        if not isinstance(top_indices, torch.Tensor):
+                            top_indices = torch.tensor(top_indices, device=sparse_acts.device)
+                        top_indices = top_indices.to(sparse_acts.device)
                         
-                        # Expand to batch and sequence dimensions [batch, seq, hidden]
-                        intervention_tensor = activation_pattern.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
-                        
-                        # Add scaled raw activations
-                        hidden_states = hidden_states + scale * intervention_tensor
+                        # Apply intervention to top-k features
+                        for i, feat_idx in enumerate(top_indices):
+                            if i < len(reasoning_activations):
+                                # Option 1: Multiply existing activations by scale factor
+                                sparse_acts[:, feat_idx] = sparse_acts[:, feat_idx] * (1 + scale * reasoning_activations[i])
+                                
+                                # Option 2: Set to specific value (uncomment to use instead)
+                                # sparse_acts[:, feat_idx] = scale * reasoning_activations[i]
+                    
+                    # Decode back to hidden space
+                    modified_hidden = sae_model.decode(sparse_acts)
+                    
+                    # Reshape back to original shape
+                    hidden_states = modified_hidden.view(original_shape)
                 
                 # Update output
                 if isinstance(output, tuple):
@@ -453,7 +507,7 @@ class InterventionEvaluator:
         
         # Register hook on the layer (post-forward hook)
         hook = target_layer.register_forward_hook(
-            create_sae_intervention_hook(directions, intervention_type, scale)
+            create_sae_intervention_hook(directions, intervention_type, scale, sae_model)
         )
         hooks.append(hook)
         
@@ -493,12 +547,17 @@ class InterventionEvaluator:
             # Map to utils dataset names
             utils_dataset_name = self._map_dataset_name(dataset_name)
             
-            # Load dataset and prompt template using utils functions
-            ds_data = load_dataset(ds_name=utils_dataset_name, dataset_dir=self.config.dataset_dir, split='test')
+            # For MMLU-Pro, use the cached samples with reasoning scores
+            # For other datasets, load fresh data
+            if utils_dataset_name == 'MMLU-Pro':
+                # Use cached samples that have reasoning scores
+                ds_data = random.sample(self.feature_extractor.samples, 200)
+            else:
+                # Load fresh dataset for other datasets
+                ds_data = load_dataset(ds_name=utils_dataset_name, dataset_dir=self.config.dataset_dir, split='test')
+                ds_data = random.sample(ds_data, 200)
+                
             prompt_template, prompt_template_no_cot = load_prompt_template(ds_name=utils_dataset_name, dataset_dir=self.config.dataset_dir)
-            
-            # Sample data (similar to features_intervention.py approach)
-            ds_data = random.sample(ds_data, 200)
             
             # Get model architecture info for utils functions
             layer_name, attn_name, mlp_name, model_layers_num = self._get_model_architecture_info()
@@ -507,8 +566,8 @@ class InterventionEvaluator:
             self.results[dataset_name] = {}
             
             # Baseline evaluation (no intervention)
-            print(f'****Running baseline evaluation on {dataset_name}')
-            self.sae_evaluation_on_dataset(
+            print(f'****Running baseline evaluation on {dataset_name} with SAE pipeline')
+            baseline_performance = self.sae_evaluation_on_dataset(
                 val_sampled_data=ds_data, 
                 prompts_cot=prompt_template, 
                 prompts_no_cot=prompt_template_no_cot,
@@ -522,22 +581,13 @@ class InterventionEvaluator:
                 scale=0.0
             )
             
-            # Compute baseline performance
-            if utils_dataset_name != 'MMLU-Pro':
-                baseline_performance = compute_performance_on_reason_subset(
-                    val_sampled_data=ds_data, 
-                    intervention=False, 
-                    ds_name=utils_dataset_name
-                )
-            else:
-                reason_indices = [ix for ix, sample in enumerate(ds_data) if sample['memory_reason_score'] > 0.5]
-                memory_indices = [ix for ix, sample in enumerate(ds_data) if sample['memory_reason_score'] <= 0.5]
-                baseline_performance = compute_performance_on_reason_memory_subset(
-                    val_sampled_data=ds_data, 
-                    memory_indices=memory_indices,
-                    reason_indices=reason_indices, 
-                    intervention=False
-                )
+            # Store baseline performance
+            self.results[dataset_name]['baseline'] = {
+                'performance': baseline_performance,
+                'responses': []  # Baseline responses not stored for space
+            }
+            
+            print(f'Baseline performance for {dataset_name}: {baseline_performance}')
             
             # Intervention evaluation across layers
             for layer in self.config.layers_to_evaluate:
@@ -561,63 +611,36 @@ class InterventionEvaluator:
                 self.results[dataset_name][f'layer_{layer}'] = {}
                 
                 # Test different intervention methods and scales
-                for intervention_type in ['projected', 'raw']:
+                for intervention_type in ['projected', 'raw', 'activation_patching']:
                     for scale in self.config.intervention_scales:
-                        print(f'  Testing {intervention_type} intervention with scale {scale}')
-                        
-                        # Prepare intervention directions based on method
-                        if intervention_type == 'projected':
-                            # Use SAE decoder directions: project activations onto learned feature directions
-                            # Shape: [top_k, hidden_dim] - these are the decoder weight vectors
-                            ablation_dir = sae_features['feature_directions']
-                        else:  # raw
-                            # Use raw sparse activations: directly add the activation magnitudes
-                            # Shape: [top_k] - these are scalar activation values
-                            ablation_dir = sae_features['reasoning_activations']
-                        
+                        print(f'  Testing {intervention_type} intervention with scale {scale} using SAE pipeline')
+                         
                         # Create a copy of data for this intervention
                         ds_data_copy = copy.deepcopy(ds_data)
                         
                         # Run evaluation with SAE intervention
-                        self.sae_evaluation_on_dataset(
+                        intervention_performance = self.sae_evaluation_on_dataset(
                             val_sampled_data=ds_data_copy, 
                             prompts_cot=prompt_template, 
                             prompts_no_cot=prompt_template_no_cot,
                             run_in_fewshot=True, 
                             run_in_cot=True,
                             intervention_layer=layer,
-                            intervention_directions=ablation_dir, 
+                            intervention_directions=sae_features, 
                             intervention_type=intervention_type,
                             batch_size=self.config.batch_size, 
                             ds_name=utils_dataset_name,
                             scale=scale
                         )
                         
-                        # Compute performance for this intervention
-                        if utils_dataset_name != 'MMLU-Pro':
-                            intervention_performance = compute_performance_on_reason_subset(
-                                val_sampled_data=ds_data_copy, 
-                                intervention=True, 
-                                ds_name=utils_dataset_name, 
-                                intervention_layer=layer
-                            )
-                        else:
-                            reason_indices = [ix for ix, sample in enumerate(ds_data_copy) if sample['memory_reason_score'] > 0.5]
-                            memory_indices = [ix for ix, sample in enumerate(ds_data_copy) if sample['memory_reason_score'] <= 0.5]
-                            intervention_performance = compute_performance_on_reason_memory_subset(
-                                val_sampled_data=ds_data_copy, 
-                                memory_indices=memory_indices,
-                                reason_indices=reason_indices, 
-                                intervention=True, 
-                                intervention_layer=layer
-                            )
-                        
                         # Store results
-                        key = f'{intervention_type}_scale_{scale}'
-                        self.results[dataset_name][f'layer_{layer}'][key] = {
+                        self.results[dataset_name][f'layer_{layer}'][f'{intervention_type}_scale_{scale}'] = {
                             'performance': intervention_performance,
                             'responses': [item.get('pred_with_intervention', '') for item in ds_data_copy]
                         }
+                        
+                        # Debug print to track performance values
+                        print(f"    Performance result: {intervention_performance}")
         
         # Save results and generate report
         self.save_results()
@@ -652,13 +675,41 @@ class InterventionEvaluator:
         
         # Create comparison table
         comparison_data = []
+        baseline_data = []
         
         for dataset_name in self.results.keys():
+            # Process baseline performance first
+            if 'baseline' in self.results[dataset_name]:
+                baseline_performance = self.results[dataset_name]['baseline'].get('performance', {})
+                print(f"  Baseline performance for {dataset_name}: {baseline_performance}")
+                
+
+                if dataset_name == 'mmlu-pro':
+                    for metric_type, acc_key in [('Reasoning', 'reason_accuracy'), ('Memory', 'memory_accuracy')]:
+                        if acc_key in baseline_performance:
+                            baseline_data.append({
+                                'Dataset': dataset_name,
+                                'Metric Type': metric_type, 
+                                'Baseline Performance': f"{baseline_performance[acc_key]:.4f}"
+                            })
+                else:
+                    accuracy = baseline_performance.get('accuracy') or baseline_performance.get('reason_accuracy')
+                    if accuracy is not None:
+                        baseline_data.append({
+                            'Dataset': dataset_name,
+                            'Metric Type': 'Overall',
+                            'Baseline Performance': f"{accuracy:.4f}"
+                        })
+            
+            # Process intervention results
             for layer_key in self.results[dataset_name].keys():
+                if layer_key == 'baseline':  # Skip baseline
+                    continue
+                    
                 layer = int(layer_key.split('_')[1])
                 
                 # Check both intervention types
-                for intervention_type in ['projected', 'raw']:
+                for intervention_type in ['projected', 'raw', 'activation_patching']:
                     best_scale = 0.0
                     best_performance = 0.0
                     
@@ -666,14 +717,27 @@ class InterventionEvaluator:
                     for scale in self.config.intervention_scales:
                         key = f'{intervention_type}_scale_{scale}'
                         if key in self.results[dataset_name][layer_key]:
-                            performance = self.results[dataset_name][layer_key][key]['performance']
-                            # Extract accuracy from performance dict if available
-                            if isinstance(performance, dict) and 'accuracy' in performance:
-                                accuracy = performance['accuracy']
-                            else:
-                                accuracy = performance  # Assume it's a float
+                            result_data = self.results[dataset_name][layer_key][key]
+                            performance = result_data.get('performance', {})
                             
-                            if accuracy > best_performance:
+                            # Extract accuracy based on dataset and performance structure
+                            accuracy = None
+                            if dataset_name == 'mmlu-pro':
+                                # For MMLU-Pro, prioritize reasoning accuracy
+                                if 'reason_accuracy' in performance:
+                                    accuracy = performance['reason_accuracy']
+                                elif 'memory_accuracy' in performance:
+                                    accuracy = performance['memory_accuracy']
+                            else:
+                                # For other datasets (gsm8k, mgsm, popqa), look for accuracy
+                                if 'accuracy' in performance:
+                                    accuracy = performance['accuracy']
+                                elif 'reason_accuracy' in performance:
+                                    accuracy = performance['reason_accuracy']
+                                elif 'memory_accuracy' in performance:
+                                    accuracy = performance['memory_accuracy']
+                            # Skip if accuracy is None or not a number
+                            if accuracy is not None and isinstance(accuracy, (int, float)) and accuracy > best_performance:
                                 best_performance = accuracy
                                 best_scale = scale
                     
@@ -687,6 +751,27 @@ class InterventionEvaluator:
                         })
         
         # Create DataFrame and format as table
+        # First, add baseline performance table
+        if baseline_data:
+            df_baseline = pd.DataFrame(baseline_data)
+            report_lines.append("### Baseline Performance (No Intervention):")
+            
+            # Manual table creation for baseline
+            headers = list(df_baseline.columns)
+            rows = df_baseline.values.tolist()
+            
+            header_row = "| " + " | ".join(headers) + " |"
+            separator_row = "|" + "|".join(["-" * (len(str(h)) + 2) for h in headers]) + "|"
+            
+            report_lines.append(header_row)
+            report_lines.append(separator_row)
+            
+            for row in rows:
+                data_row = "| " + " | ".join([str(cell) for cell in row]) + " |"
+                report_lines.append(data_row)
+            
+            report_lines.append("")
+        
         if comparison_data:
             df = pd.DataFrame(comparison_data)
             report_lines.append("### SAE Intervention Performance:")
@@ -748,12 +833,24 @@ class InterventionEvaluator:
                 ax = axes[idx]
                 
                 if dataset_name in self.results:
+                    # Get baseline performance for reference line
+                    baseline_performance = None
+                    if 'baseline' in self.results[dataset_name]:
+                        baseline_data = self.results[dataset_name]['baseline'].get('performance', {})
+                        if dataset_name == 'mmlu-pro':
+                            # Use reasoning accuracy for MMLU-Pro baseline
+                            baseline_performance = baseline_data.get('reason_accuracy')
+                        else:
+                            baseline_performance = baseline_data.get('accuracy') or baseline_data.get('reason_accuracy')
+                    
                     # Plot both intervention types
-                    for intervention_type in ['projected', 'raw']:
+                    for intervention_type in ['projected', 'raw', 'activation_patching']:
                         layers = []
                         performances = []
                         
                         for layer_key in self.results[dataset_name].keys():
+                            if layer_key == 'baseline':  # Skip baseline in layer iteration
+                                continue
                             layer = int(layer_key.split('_')[1])
                             
                             # Find best performance for this intervention type
@@ -761,14 +858,31 @@ class InterventionEvaluator:
                             for scale in self.config.intervention_scales:
                                 key = f'{intervention_type}_scale_{scale}'
                                 if key in self.results[dataset_name][layer_key]:
-                                    performance = self.results[dataset_name][layer_key][key]['performance']
-                                    # Extract accuracy if it's a dict
-                                    if isinstance(performance, dict) and 'accuracy' in performance:
-                                        accuracy = performance['accuracy']
-                                    else:
+                                    result_data = self.results[dataset_name][layer_key][key]
+                                    performance = result_data.get('performance', {})
+                                    
+                                    # Extract accuracy based on dataset
+                                    accuracy = None
+                                    if isinstance(performance, dict):
+                                        if dataset_name == 'mmlu-pro':
+                                            # For MMLU-Pro, prioritize reasoning accuracy
+                                            if 'reason_accuracy' in performance:
+                                                accuracy = performance['reason_accuracy']
+                                            elif 'memory_accuracy' in performance:
+                                                accuracy = performance['memory_accuracy']
+                                        else:
+                                            # For other datasets
+                                            if 'accuracy' in performance:
+                                                accuracy = performance['accuracy']
+                                            elif 'reason_accuracy' in performance:
+                                                accuracy = performance['reason_accuracy']
+                                            elif 'memory_accuracy' in performance:
+                                                accuracy = performance['memory_accuracy']
+                                    elif isinstance(performance, (int, float)):
                                         accuracy = performance
                                     
-                                    best_performance = max(best_performance, accuracy)
+                                    if accuracy is not None and isinstance(accuracy, (int, float)):
+                                        best_performance = max(best_performance, accuracy)
                             
                             if best_performance > 0:
                                 layers.append(layer)
@@ -777,10 +891,15 @@ class InterventionEvaluator:
                         if layers:
                             ax.plot(layers, performances, marker='o', 
                                    label=f'{intervention_type} features', linewidth=2)
+                    
+                    # Add baseline reference line
+                    if baseline_performance is not None and layers:
+                        ax.axhline(y=baseline_performance, color='red', linestyle='--', 
+                                  label='Baseline (no intervention)', linewidth=2, alpha=0.8)
                 
                 ax.set_xlabel('Layer')
                 ax.set_ylabel('Best Performance')
-                ax.set_title(f'{dataset_name} - SAE Intervention')
+                ax.set_title(f'{dataset_name.upper()} - SAE Intervention vs Baseline')
                 ax.legend()
                 ax.grid(True, alpha=0.3)
             
@@ -804,7 +923,7 @@ def main():
     parser.add_argument('--model_name', type=str, default="Llama-3.1-8B")
     parser.add_argument('--sae_models_path', type=str, 
                        default="/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/outputs/final_results/models")
-    parser.add_argument('--datasets', nargs='+', default=['mmlu-pro'], choices=['gsm8k', 'popqa', 'mmlu-pro'])
+    parser.add_argument('--datasets', nargs='+', default=['mmlu-pro'], choices=['gsm8k', 'popqa', 'mmlu-pro', 'mgsm', 'gsm-symbolic', 'c-eval-h'])
     parser.add_argument('--layers', nargs='+', type=int, default=[15, 20])
     parser.add_argument('--scales', nargs='+', type=float, default=[0.1, 0.3, 0.5])
     
