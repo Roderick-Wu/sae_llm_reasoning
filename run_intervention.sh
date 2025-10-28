@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=0-10:00 # D-HH:MM
+#SBATCH --time=0-120:00 # D-HH:MM
 #SBATCH --account=def-zhijing
 #SBATCH --mem=64G
 #SBATCH --gpus-per-node=h100:1
@@ -11,23 +11,12 @@ module load arrow/21.0.0
 pip install -r requirements.txt
 
 
-echo "Starting SAE training for reasoning feature extraction..."
+
+
 
 # Set paths
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH="${PYTHONPATH}:/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae"
-
-# Create output directories
-mkdir -p /home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/outputs
-mkdir -p /home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/outputs/checkpoints
-mkdir -p /home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/outputs/analysis
-
-CONFIG_FILE="/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/default_sae_config.yaml"
-
-# Run training
-python /home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/sae_reasoning_trainer.py \
-    --config $CONFIG_FILE
-echo "SAE training completed!"
 
 CONFIG_FILE="/home/wuroderi/projects/def-zhijing/wuroderi/steering_vs_sae/evaluation_config.yaml"
 # Run evaluation

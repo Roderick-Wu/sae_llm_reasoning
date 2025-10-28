@@ -17,6 +17,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 from sae_reasoning_trainer import SparseAutoencoder, SAEConfig
 import warnings
+import yaml
 
 # Import utility functions 
 from utils import (
@@ -29,6 +30,10 @@ from utils import (
 )
 
 warnings.filterwarnings('ignore')
+
+torch.manual_seed(1)
+np.random.seed(1)
+random.seed(1)
 
 
 @dataclass
@@ -149,10 +154,13 @@ class FeatureExtractor:
         differential = reasoning_mean - memory_mean
         
         # Get top features
-        top_indices = torch.topk(differential, k=top_k)[1]
+        top_indices = torch.topk(differential, k=top_k)[1] # (values, indices)[1]
         
         # Extract feature directions from decoder
         feature_directions = sae.decoder.weight[:, top_indices].T  # Transpose to flip to [top_k, hidden_dim]
+        
+        # Normalize all feature directions to unit vectors
+        feature_directions = F.normalize(feature_directions, dim=-1)
         
         return {
             'feature_directions': feature_directions.cpu(),
@@ -245,10 +253,14 @@ class InterventionEvaluator:
 
      
     def sae_evaluation_on_dataset(self, val_sampled_data, prompts_cot=None, prompts_no_cot=None, 
-                                 run_in_fewshot=True, run_in_cot=True, intervention_layer=None, 
-                                 intervention_directions=None, intervention_type=None, 
+                                 run_in_fewshot=True, run_in_cot=True, intervention_layers_dict=None, 
+                                 intervention_type=None, 
                                  batch_size=4, scale=0.1, ds_name='MMLU-Pro'):
-        """Custom evaluation function for SAE interventions (based on utils.evaluation_on_dataset)"""
+        """Custom evaluation function for SAE interventions (based on utils.evaluation_on_dataset)
+        
+        Args:
+            intervention_layers_dict: Dict mapping layer_idx -> feature_directions for multi-layer intervention
+        """
         
         queries_batch = []  
         entry_batch = []
@@ -292,9 +304,9 @@ class InterventionEvaluator:
             if len(queries_batch) == batch_size or ix == len(val_sampled_data) - 1:
                 
                 # Generate responses with or without SAE intervention
-                if intervention_layer is not None and intervention_directions is not None:
+                if intervention_layers_dict is not None:
                     responses = self.generate_with_sae_intervention(
-                        queries_batch, intervention_layer, intervention_directions, 
+                        queries_batch, intervention_layers_dict, 
                         intervention_type, scale
                     )
                 else:
@@ -312,7 +324,7 @@ class InterventionEvaluator:
                         entry['model_predict_correctness'] = (entry["answer"] == prediction)
                         
                         # Store intervention response if applicable
-                        if intervention_layer is not None:
+                        if intervention_layers_dict is not None:
                             entry['pred_with_intervention'] = answer
 
                 elif ds_name in ['GSM8k', 'GSM-symbolic']:  
@@ -321,7 +333,7 @@ class InterventionEvaluator:
                         prediction = get_prediction(answer, ds_name)
                         entry['model_predict_correctness'] = (entry["final_answer"] == prediction)
                         
-                        if intervention_layer is not None:
+                        if intervention_layers_dict is not None:
                             entry['pred_with_intervention'] = answer
 
                 elif ds_name in ['MGSM']:  
@@ -329,7 +341,7 @@ class InterventionEvaluator:
                         prediction = get_prediction(answer, ds_name)
                         entry['model_predict_correctness'] = (float(entry['answer']) == prediction)
                         
-                        if intervention_layer is not None:
+                        if intervention_layers_dict is not None:
                             entry['pred_with_intervention'] = answer
                 
                 elif ds_name in ['C-Eval-H']:  
@@ -337,7 +349,7 @@ class InterventionEvaluator:
                         prediction = get_prediction(answer, ds_name)
                         entry['model_predict_correctness'] = (entry['answer'] == prediction)
                         
-                        if intervention_layer is not None:
+                        if intervention_layers_dict is not None:
                             entry['pred_with_intervention'] = answer
 
                 elif ds_name == 'PopQA':
@@ -350,7 +362,7 @@ class InterventionEvaluator:
                                 is_correct = True
                         entry['model_predict_correctness'] = is_correct
                         
-                        if intervention_layer is not None:
+                        if intervention_layers_dict is not None:
                             entry['pred_with_intervention'] = answer
                         
                 queries_batch = []
@@ -383,22 +395,24 @@ class InterventionEvaluator:
                 'reason_accuracy': reason_accuracy
             }
     
-    def generate_with_sae_intervention(self, questions, intervention_layer, intervention_directions, 
+    def generate_with_sae_intervention(self, questions, intervention_layers_dict, 
                                      intervention_type, scale):
-        """Generate text with SAE feature interventions"""
+        """Generate text with SAE feature interventions
+        
+        Args:
+            questions: List of input questions
+            intervention_layers_dict: Dict mapping layer_idx -> feature_directions for that layer
+            intervention_type: Type of intervention ('projected', 'raw', 'activation_patching')
+            scale: Intervention scale
+        """
         
         inputs = self.tokenizer(questions, return_tensors="pt", padding="longest", 
                                return_token_type_ids=False).to(self.device)
         input_length = inputs.input_ids.size(1)
 
-        # Get SAE model for activation patching (if needed)
-        sae_model = None
-        if intervention_type == 'activation_patching' and intervention_layer in self.feature_extractor.sae_models:
-            sae_model = self.feature_extractor.sae_models[intervention_layer]
-        
-        # Create SAE intervention hooks
-        hooks = self.set_sae_intervention_hooks(
-            intervention_layer, intervention_directions, intervention_type, scale, sae_model
+        # Create SAE intervention hooks for all layers
+        hooks = self.set_sae_intervention_hooks_multi_layer(
+            intervention_layers_dict, intervention_type, scale
         )
         
         # Generate with hooks
@@ -428,21 +442,24 @@ class InterventionEvaluator:
                     # Use decoder weights as directions (existing approach)
                     directions_tensor = directions['feature_directions'].to(hidden_states.device).to(hidden_states.dtype)
                     
-                    # Apply each feature direction
+                    # Apply each feature direction (already normalized at extraction)
                     for direction in directions_tensor:
+                        # Extra normalization for safety (already normalized but doesn't hurt)
                         direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
                         projection = (hidden_states @ direction).unsqueeze(-1) * direction
                         hidden_states = hidden_states + scale * projection
                         
                 elif intervention_type == 'raw':
-                    # Use feature directions directly without projection (more forceful than projected)
+                    # Use feature directions directly without projection
                     # Scale each feature direction by its corresponding reasoning activation value
                     feature_directions = directions['feature_directions'].to(hidden_states.device).to(hidden_states.dtype)
                     reasoning_activations = directions['reasoning_activations'].to(hidden_states.device).to(hidden_states.dtype)
                     
-                    # Add each feature direction scaled by its activation directly
+                    # Add each feature direction (now normalized) scaled by activation
                     for i, (direction, activation) in enumerate(zip(feature_directions, reasoning_activations)):
-                        # Scale the feature direction by the activation strength and intervention scale
+                        # Ensure normalization (already done at extraction, but double-check)
+                        direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+                        # Scale the normalized direction by activation strength and intervention scale
                         scaled_direction = direction * activation * scale
                         hidden_states = hidden_states + scaled_direction
                         
@@ -513,6 +530,121 @@ class InterventionEvaluator:
         
         return hooks
     
+    def set_sae_intervention_hooks_multi_layer(self, intervention_layers_dict, intervention_type, scale):
+        """Set up hooks for SAE intervention across multiple layers simultaneously
+        
+        Args:
+            intervention_layers_dict: Dict mapping layer_idx -> directions dict for that layer
+            intervention_type: Type of intervention ('projected', 'raw', 'activation_patching')
+            scale: Intervention scale
+        """
+        hooks = []
+        
+        def create_sae_intervention_hook(directions, intervention_type, scale, sae_model=None):
+            def hook_fn(module, input, output):
+                # Handle tuple output (common in transformers)
+                if isinstance(output, tuple):
+                    hidden_states = output[0]
+                else:
+                    hidden_states = output
+                    
+                # Apply intervention to all positions
+                if intervention_type == 'projected':
+                    # Use decoder weights as directions (existing approach)
+                    directions_tensor = directions['feature_directions'].to(hidden_states.device).to(hidden_states.dtype)
+                    
+                    # Apply each feature direction (already normalized at extraction)
+                    for direction in directions_tensor:
+                        # Extra normalization for safety (already normalized but doesn't hurt)
+                        direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+                        projection = (hidden_states @ direction).unsqueeze(-1) * direction
+                        hidden_states = hidden_states + scale * projection
+                        
+                elif intervention_type == 'raw':
+                    # Use feature directions directly without projection
+                    feature_directions = directions['feature_directions'].to(hidden_states.device).to(hidden_states.dtype)
+                    reasoning_activations = directions['reasoning_activations'].to(hidden_states.device).to(hidden_states.dtype)
+                    
+                    # Add each feature direction (now normalized) scaled by activation
+                    for i, (direction, activation) in enumerate(zip(feature_directions, reasoning_activations)):
+                        # Ensure normalization (already done at extraction, but double-check)
+                        direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+                        # Scale the normalized direction by activation strength and intervention scale
+                        scaled_direction = direction * activation * scale
+                        hidden_states = hidden_states + scaled_direction
+                        
+                elif intervention_type == 'activation_patching':
+                    # Activation patching: encode to sparse, modify top-k features, decode back
+                    if sae_model is None:
+                        raise ValueError("SAE model required for activation patching intervention")
+                    
+                    # Get original shape
+                    original_shape = hidden_states.shape  # [batch, seq, hidden]
+                    
+                    # Flatten to [batch*seq, hidden] for SAE processing
+                    flat_hidden = hidden_states.view(-1, hidden_states.size(-1))
+                    
+                    # Encode to sparse representation
+                    sparse_acts = sae_model.encode(flat_hidden)  # [batch*seq, dict_size]
+                    
+                    # Get top-k feature indices and values for modification
+                    top_indices = directions.get('feature_indices', None)
+                    reasoning_activations = directions['reasoning_activations'].to(hidden_states.device).to(hidden_states.dtype)
+                    
+                    if top_indices is not None:
+                        # Convert to tensor if needed
+                        if not isinstance(top_indices, torch.Tensor):
+                            top_indices = torch.tensor(top_indices, device=sparse_acts.device)
+                        top_indices = top_indices.to(sparse_acts.device)
+                        
+                        # Apply intervention to top-k features
+                        for i, feat_idx in enumerate(top_indices):
+                            if i < len(reasoning_activations):
+                                # Multiply existing activations by scale factor
+                                sparse_acts[:, feat_idx] = sparse_acts[:, feat_idx] * (1 + scale * reasoning_activations[i])
+                    
+                    # Decode back to hidden space
+                    modified_hidden = sae_model.decode(sparse_acts)
+                    
+                    # Reshape back to original shape
+                    hidden_states = modified_hidden.view(original_shape)
+                
+                # Update output
+                if isinstance(output, tuple):
+                    output = (hidden_states,) + output[1:]
+                else:
+                    output = hidden_states
+                    
+                return output
+            
+            return hook_fn
+        
+        # Get the target layers for intervention
+        layer_name, _, _, _ = self._get_model_architecture_info()
+        
+        # Navigate to the layers
+        attributes = layer_name.split(".")
+        current_obj = self.model
+        for attr in attributes:
+            current_obj = getattr(current_obj, attr)
+        
+        # Register hooks for each layer in the dict
+        for layer_idx, directions in intervention_layers_dict.items():
+            target_layer = current_obj[layer_idx]
+            
+            # Get SAE model for activation patching (if needed)
+            sae_model = None
+            if intervention_type == 'activation_patching' and layer_idx in self.feature_extractor.sae_models:
+                sae_model = self.feature_extractor.sae_models[layer_idx]
+            
+            # Register hook on this layer
+            hook = target_layer.register_forward_hook(
+                create_sae_intervention_hook(directions, intervention_type, scale, sae_model)
+            )
+            hooks.append(hook)
+        
+        return hooks
+    
     def remove_hooks(self, hooks):
         """Remove registered hooks"""
         for hook in hooks:
@@ -573,8 +705,7 @@ class InterventionEvaluator:
                 prompts_no_cot=prompt_template_no_cot,
                 run_in_fewshot=True, 
                 run_in_cot=True,
-                intervention_layer=None,
-                intervention_directions=None, 
+                intervention_layers_dict=None,
                 intervention_type=None,
                 batch_size=self.config.batch_size, 
                 ds_name=utils_dataset_name,
@@ -589,58 +720,53 @@ class InterventionEvaluator:
             
             print(f'Baseline performance for {dataset_name}: {baseline_performance}')
             
-            # Intervention evaluation across layers
+            # Extract SAE features from ALL layers we want to evaluate
+            print(f'Extracting SAE features from layers: {self.config.layers_to_evaluate}')
+            all_layers_features = {}
             for layer in self.config.layers_to_evaluate:
                 if layer not in self.feature_extractor.sae_models:
-                    print(f"Skipping layer {layer} for SAE (model not available)")
-                    continue
-                    
-                if layer <= 2:
+                    print(f"Skipping layer {layer} (SAE model not available)")
                     continue
                 
-                print(f'Doing SAE Intervention in Layer {layer}')
-                
-                # Extract SAE features for this layer
+                print(f'  Extracting features from layer {layer}')
                 sae_features = self.feature_extractor.extract_sae_features(layer, top_k=5)
-                # Returns:
-                # - 'feature_directions': SAE decoder weights for top reasoning features [top_k, hidden_dim]
-                # - 'reasoning_activations': Mean sparse activations for reasoning samples [top_k]
-                # - 'feature_indices': Indices of the top features in SAE dictionary
-                # - 'differential_scores': Reasoning vs memory activation differences
-                
-                self.results[dataset_name][f'layer_{layer}'] = {}
-                
-                # Test different intervention methods and scales
-                for intervention_type in ['projected', 'raw', 'activation_patching']:
-                    for scale in self.config.intervention_scales:
-                        print(f'  Testing {intervention_type} intervention with scale {scale} using SAE pipeline')
-                         
-                        # Create a copy of data for this intervention
-                        ds_data_copy = copy.deepcopy(ds_data)
-                        
-                        # Run evaluation with SAE intervention
-                        intervention_performance = self.sae_evaluation_on_dataset(
-                            val_sampled_data=ds_data_copy, 
-                            prompts_cot=prompt_template, 
-                            prompts_no_cot=prompt_template_no_cot,
-                            run_in_fewshot=True, 
-                            run_in_cot=True,
-                            intervention_layer=layer,
-                            intervention_directions=sae_features, 
-                            intervention_type=intervention_type,
-                            batch_size=self.config.batch_size, 
-                            ds_name=utils_dataset_name,
-                            scale=scale
-                        )
-                        
-                        # Store results
-                        self.results[dataset_name][f'layer_{layer}'][f'{intervention_type}_scale_{scale}'] = {
-                            'performance': intervention_performance,
-                            'responses': [item.get('pred_with_intervention', '') for item in ds_data_copy]
-                        }
-                        
-                        # Debug print to track performance values
-                        print(f"    Performance result: {intervention_performance}")
+                all_layers_features[layer] = sae_features
+            
+            print(f'Successfully extracted features from {len(all_layers_features)} layers')
+            
+            # Multi-layer intervention evaluation
+            self.results[dataset_name]['multi_layer'] = {}
+            
+            for intervention_type in ['projected', 'raw', 'activation_patching']:
+                for scale in self.config.intervention_scales:
+                    print(f'\n*** Testing {intervention_type} intervention with scale {scale} on ALL layers simultaneously ***')
+                     
+                    # Create a copy of data for this intervention
+                    ds_data_copy = copy.deepcopy(ds_data)
+                    
+                    # Run evaluation with multi-layer SAE intervention
+                    intervention_performance = self.sae_evaluation_on_dataset(
+                        val_sampled_data=ds_data_copy, 
+                        prompts_cot=prompt_template, 
+                        prompts_no_cot=prompt_template_no_cot,
+                        run_in_fewshot=True, 
+                        run_in_cot=True,
+                        intervention_layers_dict=all_layers_features,  # Pass all layers!
+                        intervention_type=intervention_type,
+                        batch_size=self.config.batch_size, 
+                        ds_name=utils_dataset_name,
+                        scale=scale
+                    )
+                    
+                    # Store results
+                    self.results[dataset_name]['multi_layer'][f'{intervention_type}_scale_{scale}'] = {
+                        'performance': intervention_performance,
+                        'layers_used': list(all_layers_features.keys()),
+                        'num_layers': len(all_layers_features),
+                        'responses': [item.get('pred_with_intervention', '') for item in ds_data_copy]
+                    }
+                    
+                    print(f'  Performance: {intervention_performance}')
         
         # Save results and generate report
         self.save_results()
@@ -702,53 +828,85 @@ class InterventionEvaluator:
                         })
             
             # Process intervention results
-            for layer_key in self.results[dataset_name].keys():
-                if layer_key == 'baseline':  # Skip baseline
-                    continue
-                    
-                layer = int(layer_key.split('_')[1])
+            # Check if we have multi_layer results (new structure) or layer_X results (old structure)
+            if 'multi_layer' in self.results[dataset_name]:
+                # New multi-layer structure
+                multi_layer_results = self.results[dataset_name]['multi_layer']
                 
-                # Check both intervention types
-                for intervention_type in ['projected', 'raw', 'activation_patching']:
-                    best_scale = 0.0
-                    best_performance = 0.0
+                for intervention_key, result_data in multi_layer_results.items():
+                    # Parse: "projected_scale_0.1" -> ("projected", 0.1)
+                    parts = intervention_key.rsplit('_scale_', 1)
+                    if len(parts) == 2:
+                        intervention_type = parts[0]
+                        scale = float(parts[1])
+                        
+                        performance = result_data.get('performance', {})
+                        num_layers = result_data.get('num_layers', 0)
+                        
+                        # Extract accuracy
+                        accuracy = None
+                        if dataset_name == 'mmlu-pro':
+                            accuracy = performance.get('reason_accuracy')
+                        else:
+                            accuracy = performance.get('accuracy') or performance.get('reason_accuracy')
+                        
+                        if accuracy is not None:
+                            comparison_data.append({
+                                'Dataset': dataset_name,
+                                'Layers': f"{num_layers} layers",
+                                'Intervention Type': intervention_type,
+                                'Performance': f"{accuracy:.4f}",
+                                'Scale': scale
+                            })
+            else:
+                # Old single-layer structure (for backwards compatibility)
+                for layer_key in self.results[dataset_name].keys():
+                    if layer_key == 'baseline':  # Skip baseline
+                        continue
+                        
+                    layer = int(layer_key.split('_')[1])
                     
-                    # Find best scale for this intervention type
-                    for scale in self.config.intervention_scales:
-                        key = f'{intervention_type}_scale_{scale}'
-                        if key in self.results[dataset_name][layer_key]:
-                            result_data = self.results[dataset_name][layer_key][key]
-                            performance = result_data.get('performance', {})
-                            
-                            # Extract accuracy based on dataset and performance structure
-                            accuracy = None
-                            if dataset_name == 'mmlu-pro':
-                                # For MMLU-Pro, prioritize reasoning accuracy
-                                if 'reason_accuracy' in performance:
-                                    accuracy = performance['reason_accuracy']
-                                elif 'memory_accuracy' in performance:
-                                    accuracy = performance['memory_accuracy']
-                            else:
-                                # For other datasets (gsm8k, mgsm, popqa), look for accuracy
-                                if 'accuracy' in performance:
-                                    accuracy = performance['accuracy']
-                                elif 'reason_accuracy' in performance:
-                                    accuracy = performance['reason_accuracy']
-                                elif 'memory_accuracy' in performance:
-                                    accuracy = performance['memory_accuracy']
-                            # Skip if accuracy is None or not a number
-                            if accuracy is not None and isinstance(accuracy, (int, float)) and accuracy > best_performance:
-                                best_performance = accuracy
-                                best_scale = scale
-                    
-                    if best_performance > 0:
-                        comparison_data.append({
-                            'Dataset': dataset_name,
-                            'Layer': layer,
-                            'Intervention Type': intervention_type,
-                            'Best Performance': f"{best_performance:.3f}",
-                            'Best Scale': best_scale
-                        })
+                    # Check both intervention types
+                    for intervention_type in ['projected', 'raw', 'activation_patching']:
+                        best_scale = 0.0
+                        best_performance = 0.0
+                        
+                        # Find best scale for this intervention type
+                        for scale in self.config.intervention_scales:
+                            key = f'{intervention_type}_scale_{scale}'
+                            if key in self.results[dataset_name][layer_key]:
+                                result_data = self.results[dataset_name][layer_key][key]
+                                performance = result_data.get('performance', {})
+                                
+                                # Extract accuracy based on dataset and performance structure
+                                accuracy = None
+                                if dataset_name == 'mmlu-pro':
+                                    # For MMLU-Pro, prioritize reasoning accuracy
+                                    if 'reason_accuracy' in performance:
+                                        accuracy = performance['reason_accuracy']
+                                    elif 'memory_accuracy' in performance:
+                                        accuracy = performance['memory_accuracy']
+                                else:
+                                    # For other datasets (gsm8k, mgsm, popqa), look for accuracy
+                                    if 'accuracy' in performance:
+                                        accuracy = performance['accuracy']
+                                    elif 'reason_accuracy' in performance:
+                                        accuracy = performance['reason_accuracy']
+                                    elif 'memory_accuracy' in performance:
+                                        accuracy = performance['memory_accuracy']
+                                # Skip if accuracy is None or not a number
+                                if accuracy is not None and isinstance(accuracy, (int, float)) and accuracy > best_performance:
+                                    best_performance = accuracy
+                                    best_scale = scale
+                        
+                        if best_performance > 0:
+                            comparison_data.append({
+                                'Dataset': dataset_name,
+                                'Layer': layer,
+                                'Intervention Type': intervention_type,
+                                'Best Performance': f"{best_performance:.3f}",
+                                'Best Scale': best_scale
+                            })
         
         # Create DataFrame and format as table
         # First, add baseline performance table
@@ -799,8 +957,19 @@ class InterventionEvaluator:
             for dataset_name in self.config.test_datasets:
                 if dataset_name in df['Dataset'].values:
                     dataset_data = df[df['Dataset'] == dataset_name]
-                    best_row = dataset_data.loc[dataset_data['Best Performance'].astype(str).str.replace('[^0-9.]', '', regex=True).astype(float).idxmax()]
-                    report_lines.append(f"- **{dataset_name}**: {best_row['Intervention Type']} (Layer {best_row['Layer']}, Performance: {best_row['Best Performance']})")
+                    
+                    # Handle both old and new structure
+                    if 'Performance' in df.columns:
+                        # New multi-layer structure
+                        performance_col = 'Performance'
+                        best_row = dataset_data.loc[dataset_data[performance_col].astype(float).idxmax()]
+                        layers_info = best_row.get('Layers', 'N/A')
+                        report_lines.append(f"- **{dataset_name}**: {best_row['Intervention Type']} ({layers_info}, Performance: {best_row[performance_col]}, Scale: {best_row['Scale']})")
+                    else:
+                        # Old single-layer structure
+                        performance_col = 'Best Performance'
+                        best_row = dataset_data.loc[dataset_data[performance_col].astype(str).str.replace('[^0-9.]', '', regex=True).astype(float).idxmax()]
+                        report_lines.append(f"- **{dataset_name}**: {best_row['Intervention Type']} (Layer {best_row['Layer']}, Performance: {best_row[performance_col]})")
             
             report_lines.append("")
         else:
@@ -926,16 +1095,22 @@ def main():
     parser.add_argument('--datasets', nargs='+', default=['mmlu-pro'], choices=['gsm8k', 'popqa', 'mmlu-pro', 'mgsm', 'gsm-symbolic', 'c-eval-h'])
     parser.add_argument('--layers', nargs='+', type=int, default=[15, 20])
     parser.add_argument('--scales', nargs='+', type=float, default=[0.1, 0.3, 0.5])
+    parser.add_argument('--config', type=str, default=None, help="Path to config file (optional)") #yaml
     
     args = parser.parse_args()
     
     # Create config
-    config = EvaluationConfig()
-    config.model_name = args.model_name
-    config.sae_models_path = args.sae_models_path
-    config.test_datasets = args.datasets
-    config.layers_to_evaluate = args.layers
-    config.intervention_scales = args.scales
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        config = EvaluationConfig(**config_dict)
+    else:
+        config = EvaluationConfig()
+        config.model_name = args.model_name
+        config.sae_models_path = args.sae_models_path
+        config.test_datasets = args.datasets
+        config.layers_to_evaluate = args.layers
+        config.intervention_scales = args.scales
     
     print("Evaluation Configuration:")
     print(f"Model: {config.model_name}")

@@ -68,6 +68,27 @@ class SAEConfig:
     save_interval: int = 10
     use_wandb: bool = False
     wandb_project: str = "sae-reasoning-features"
+    
+    def __post_init__(self):
+        """Ensure proper type conversion from YAML-loaded values"""
+        # Convert numeric types that might be loaded as strings from YAML
+        self.hidden_dim = int(self.hidden_dim)
+        self.expansion_factor = int(self.expansion_factor)
+        self.batch_size = int(self.batch_size)
+        self.learning_rate = float(self.learning_rate)
+        self.num_epochs = int(self.num_epochs)
+        self.sparsity_penalty = float(self.sparsity_penalty)
+        self.reconstruction_weight = float(self.reconstruction_weight)
+        self.top_k_features = int(self.top_k_features)
+        self.reasoning_threshold = float(self.reasoning_threshold)
+        self.log_interval = int(self.log_interval)
+        self.save_interval = int(self.save_interval)
+        
+        # Ensure lists are properly formatted
+        if isinstance(self.layers_to_train, str):
+            self.layers_to_train = [int(x) for x in self.layers_to_train.strip('[]').split(',')]
+        elif isinstance(self.layers_to_train, list):
+            self.layers_to_train = [int(x) for x in self.layers_to_train]
 
 
 class SparseAutoencoder(nn.Module):
@@ -644,23 +665,23 @@ def main():
     else:
         config = SAEConfig()
     
-    # Override with command line arguments
-    if args.model_name:
-        config.model_name = args.model_name
-    if args.layers:
-        config.layers_to_train = args.layers
-    if args.epochs:
-        config.num_epochs = args.epochs
-    if args.batch_size:
-        config.batch_size = args.batch_size
-    if args.learning_rate:
-        config.learning_rate = args.learning_rate
-    if args.sparsity_penalty:
-        config.sparsity_penalty = args.sparsity_penalty
-    if args.expansion_factor:
-        config.expansion_factor = args.expansion_factor
-    if args.use_wandb:
-        config.use_wandb = True
+        # Override with command line arguments
+        if args.model_name:
+            config.model_name = args.model_name
+        if args.layers:
+            config.layers_to_train = args.layers
+        if args.epochs:
+            config.num_epochs = args.epochs
+        if args.batch_size:
+            config.batch_size = args.batch_size
+        if args.learning_rate:
+            config.learning_rate = args.learning_rate
+        if args.sparsity_penalty:
+            config.sparsity_penalty = args.sparsity_penalty
+        if args.expansion_factor:
+            config.expansion_factor = args.expansion_factor
+        if args.use_wandb:
+            config.use_wandb = True
     
     print("Configuration:")
     print(f"Model: {config.model_name}")
